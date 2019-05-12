@@ -1,0 +1,397 @@
+﻿#pragma kernel CSMain
+
+struct Material
+{
+    uint index;
+    float3 albedo;
+    float refractiveIndex;
+};
+
+float n21(float2 i) {
+    i += frac(i * float2(223.64, 823.12));
+    i += dot(i, i + 23.14);
+    return frac(i.x * i.y);
+}
+
+
+uint Hash(uint s)
+{
+    s ^= 2747636419u;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    return s;
+}
+
+float Random(uint seed)
+{
+    return float(Hash(seed)) / 4294967295.0; // 2^32-1
+}
+
+// Uniformaly distributed points on a unit sphere
+// http://mathworld.wolfram.com/SpherePointPicking.html
+float3 RandomInUnitSphere(uint seed)
+{
+    float PI2 = 6.28318530718;
+    float z = 1 - 2 * Random(seed);
+    float xy = sqrt(1.0 - z * z);
+    float sn, cs;
+    sincos(PI2 * Random(seed + 1), sn, cs);
+    return float3(sn * xy, cs * xy, z);
+}
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+    float distance;
+};
+
+struct RayHit
+{
+    float t;
+    float3 position;
+    float3 normal;
+
+    Material material;
+};
+
+Ray CreateRay(float3 origin, float3 direction, float distance = 1000.0f)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.distance = distance;
+    return ray;
+}
+
+float3 EvaluateRay(Ray r, float t)
+{
+    return r.origin + t * r.direction;
+}
+
+
+
+#define MATERIALINDEX_LAMBERT 0
+#define MATERIALINDEX_DIELECTRIC 1
+#define MATERIALINDEX_METALLIC 2
+
+bool LambertScatter(Material material, Ray ray, RayHit hit, inout float3 attenuation, inout Ray scattered, float rand)
+{
+    // TODO: Replace seed with something other than 0 (from cpu?)
+    float3 target = hit.position + hit.normal + RandomInUnitSphere(rand);
+    scattered = CreateRay(hit.position, target - hit.position);
+    attenuation = material.albedo;
+    return true;
+}
+
+float SchlickFresnelApproximation(float cosine, float ior)
+{
+    float r0 = (1.0f - ior) / (1.0f + ior);
+    r0 = r0 * r0;
+    return r0 + (1.0f - r0) * pow((1.0f - cosine), 5);
+}
+
+bool DieletricScatter(Material material, Ray ray, RayHit hit, inout float3 attenuation, inout Ray scattered, float rand)
+{
+    float3 reflectedRay = reflect(ray.direction, hit.normal);
+
+    float ni_over_nt;
+    attenuation = material.albedo;
+
+    float3 outNormal;
+    float3 refractedRay;
+
+    // for Fresnel calculations
+    float cosine;
+    float reflectionProbability;
+
+    // entering material
+    if (dot(ray.direction, hit.normal) > 0.0f)
+    {
+        outNormal = -hit.normal;
+        ni_over_nt = material.refractiveIndex;
+        cosine = material.refractiveIndex * dot(ray.direction, hit.normal) / length(ray.direction);
+    }
+    else // exiting material
+    {
+        outNormal = hit.normal;
+        ni_over_nt = 1.0f / material.refractiveIndex;
+        cosine = -dot(ray.direction, hit.normal) / length(ray.direction);
+    }
+
+    refractedRay = refract(ray.direction, outNormal, ni_over_nt);
+
+    if (length(refractedRay) > 0.001f)
+    {
+        // refraction
+        reflectionProbability = SchlickFresnelApproximation(cosine, material.refractiveIndex);
+    }
+    else
+    {
+        // total internal reflection
+        reflectionProbability = 1.0f;
+    }
+
+    // Reflection based on Fresnel approximation
+    if (rand < reflectionProbability)
+    {
+        scattered = CreateRay(hit.position, reflectedRay);
+    }
+    else
+    {
+        scattered = CreateRay(hit.position, refractedRay);
+    }
+
+    return true;
+}
+
+
+
+// Lambert material scatter
+bool MaterialScatter(Material material, Ray ray, RayHit hit, inout float3 attenuation, inout Ray scattered, float rand)
+{
+    [branch] switch (material.index)
+    {
+    case MATERIALINDEX_LAMBERT:
+        return LambertScatter(material, ray, hit, attenuation, scattered, rand);
+    case MATERIALINDEX_DIELECTRIC:
+        return DieletricScatter(material, ray, hit, attenuation, scattered, rand);
+    default:
+        return false;
+    }
+}
+
+RWTexture2D<float4> Target;
+
+Texture2D<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+
+float _Time;
+
+static const float PI = 3.14159265f;
+
+float4x4 _CameraToWorldMat;
+float4x4 _CameraInvProjMat;
+
+struct Sphere
+{
+    float3 center;
+    float radius;
+    Material material;
+};
+
+// uv has to be NDC space (-1 to 1)
+Ray CreateCameraRay(float2 uv)
+{
+    float3 origin = mul(_CameraToWorldMat, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    float3 direction = mul(_CameraInvProjMat, float4(uv, 1.0f, 1.0f)).xyz;
+    direction = mul(_CameraToWorldMat, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+
+    // TODO: replace 1000.0f with far clip distance
+    return CreateRay(origin, direction, 1000.0f);
+}
+
+// Cartesian vector to spherical coordinates conversion
+// https://en.wikipedia.org/wiki/Spherical_coordinate_system#Coordinate_system_conversions
+float3 SampleSkybox(Ray ray)
+{
+    float theta = acos(ray.direction.y) / -PI;
+    float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+    return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+}
+
+bool SphereHit(Sphere sphere, Ray ray, float tMin, float tMax, inout RayHit hit)
+{
+    float3 oc = ray.origin - sphere.center;
+    float a = dot(ray.direction, ray.direction);
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - sphere.radius * sphere.radius;
+    float discriminant = b * b - a * c;
+
+    // solve quadratic equation to find t
+    if (discriminant > 0)
+    {
+        float hitPoint1 = (-b - sqrt(b * b - a * c)) / a;
+        float hitPoint2 = (-b + sqrt(b * b - a * c)) / a;
+
+        if (hitPoint1 <= tMax && hitPoint1 >= tMin)
+        {
+            hit.t = hitPoint1;
+            hit.position = EvaluateRay(ray, hit.t);
+            hit.normal = (hit.position - sphere.center) / sphere.radius;
+            hit.material = sphere.material;
+            return true;
+        }
+
+        if (hitPoint2 <= tMax && hitPoint2 >= tMin)
+        {
+            hit.t = hitPoint2;
+            hit.position = EvaluateRay(ray, hit.t);
+            hit.normal = (hit.position - sphere.center) / sphere.radius;
+            hit.material = sphere.material;
+            return true;
+        }
+    }
+
+    // no real value, did not intersect sphere
+    return false;
+}
+
+bool RaytraceScene(Ray ray, float tMin, float tMax, inout RayHit hit)
+{
+    bool hitAnything = false;
+    float nearestDist = tMax;
+
+    // Temp Scene
+    Material lambert;
+    lambert.albedo = 1;
+    lambert.index = MATERIALINDEX_DIELECTRIC;
+    lambert.refractiveIndex = 1.5f;
+
+    Sphere sphere;
+    sphere.center = 0;
+    sphere.radius = 10.0f;
+    sphere.material = lambert;
+
+    // Todo: Iterate through some scene buffer
+    hitAnything = SphereHit(sphere, ray, tMin, tMax, hit);
+
+    return hitAnything;
+}
+float3 ShadePixel4(Ray ray, /*Scene scene,*/ uint depth, float2 uv)
+{
+    RayHit hit;
+
+    if (RaytraceScene(ray, 0.001f, ray.distance, hit))
+    {
+        Ray scatteredRay;
+        float3 attenuation;
+
+        if (MaterialScatter(hit.material, ray, hit, attenuation, scatteredRay, n21(uv)))
+        {
+            return attenuation;
+        }
+        else
+        {
+            // If scattered ray did not intersect with any object, assume we hit sky
+            return SampleSkybox(ray);
+        }
+    }
+    else
+    {
+        return SampleSkybox(ray);
+    }
+}
+float3 ShadePixel3(Ray ray, /*Scene scene,*/ uint depth, float2 uv)
+{
+    RayHit hit;
+
+    if (RaytraceScene(ray, 0.001f, ray.distance, hit))
+    {
+        Ray scatteredRay;
+        float3 attenuation;
+
+        if (MaterialScatter(hit.material, ray, hit, attenuation, scatteredRay, n21(uv)))
+        {
+            return attenuation * ShadePixel4(scatteredRay, depth - 1, uv);
+        }
+        else
+        {
+            // If scattered ray did not intersect with any object, assume we hit sky
+            return SampleSkybox(ray);
+        }
+    }
+    else
+    {
+        return SampleSkybox(ray);
+    }
+}
+
+float3 ShadePixel2(Ray ray, /*Scene scene,*/ uint depth, float2 uv)
+{
+    RayHit hit;
+
+    if (RaytraceScene(ray, 0.001f, ray.distance, hit))
+    {
+        Ray scatteredRay;
+        float3 attenuation;
+
+        if (MaterialScatter(hit.material, ray, hit, attenuation, scatteredRay, n21(uv)))
+        {
+            return attenuation * ShadePixel3(scatteredRay, depth - 1, uv);
+        }
+        else
+        {
+            // If scattered ray did not intersect with any object, assume we hit sky
+            return SampleSkybox(ray);
+        }
+    }
+    else
+    {
+        return SampleSkybox(ray);
+    }
+}
+
+float3 ShadePixel(Ray ray, /*Scene scene,*/ uint depth, float2 uv)
+{
+    RayHit hit;
+
+    // Max bounce reached
+    if (depth == 0)
+        return 0; // Assume no light at all
+
+    if (RaytraceScene(ray, 0.001f, ray.distance, hit))
+    {
+        Ray scatteredRay;
+        float3 attenuation;
+
+        if (MaterialScatter(hit.material, ray, hit, attenuation, scatteredRay, n21(uv)))
+        {
+            return attenuation * ShadePixel2(scatteredRay, depth - 1, uv);
+        }
+        else
+        {
+            // If scattered ray did not intersect with any object, assume we hit sky
+            return SampleSkybox(ray);
+        }
+    }
+    else
+    {
+        return SampleSkybox(ray);
+    }
+}
+
+
+
+
+
+
+
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 threadID : SV_DispatchThreadID)
+{
+    uint width;
+    uint height;
+    Target.GetDimensions(width, height);
+
+    // into -1 to 1 range
+    float2 uv = threadID.xy / float2(width, height) * 2.0f - 1.0f;
+    Ray ray = CreateCameraRay(uv);
+
+    // Shading
+    float3 col = 0;
+
+    for (int i = 0; i < 128; i++)
+    {
+        col += ShadePixel(ray, 2, uv * _Time + i / 16.0f); // replace with proper recursion
+    }
+
+    col /= 128.0f;
+
+    Target[threadID.xy] = float4(col, 0.0f);
+}
